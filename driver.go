@@ -11,6 +11,7 @@ type Driver interface {
 	Claim(ctx context.Context, queue QueueName, nodeID NodeID, max int) ([]*JobRow, error)
 	Complete(ctx context.Context, id JobID, output []byte) error
 	Fail(ctx context.Context, id JobID, err error) error
+	ScheduleRetry(ctx context.Context, id JobID, err error, scheduledAt time.Time) error
 	Retry(ctx context.Context, id JobID) (*JobRow, error)
 	RetryBatch(ctx context.Context, ids []JobID) error
 	Cancel(ctx context.Context, id JobID) (*JobRow, error)

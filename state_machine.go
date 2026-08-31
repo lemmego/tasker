@@ -55,7 +55,10 @@ func ComputeNextState(job *JobRow, err error) (State, time.Duration) {
 }
 
 func computeBackoff(job *JobRow, nextAttempt int) time.Duration {
-	cfg := DefaultBackoff()
+	return computeBackoffWithConfig(DefaultBackoff(), nextAttempt)
+}
+
+func computeBackoffWithConfig(cfg BackoffConfig, nextAttempt int) time.Duration {
 	maxDelay := cfg.MaxDelay
 	base := cfg.Base
 

@@ -15,7 +15,7 @@ type QueueConfig struct {
 }
 
 type Config struct {
-	Queues           map[tasker.QueueName]QueueConfig
+	Queues            map[tasker.QueueName]QueueConfig
 	HeartbeatInterval time.Duration
 	RequeueInterval   time.Duration
 	RequeueTimeout    time.Duration
@@ -51,21 +51,21 @@ type PoolManager interface {
 }
 
 type Supervisor struct {
-	mu        sync.Mutex
-	manager   *tasker.Manager
-	config    Config
-	poolMgr   PoolManager
-	running   bool
-	stopped   chan struct{}
-	cancel    context.CancelFunc
+	mu      sync.Mutex
+	manager *tasker.Manager
+	config  Config
+	poolMgr PoolManager
+	running bool
+	stopped chan struct{}
+	cancel  context.CancelFunc
 }
 
 func New(mgr *tasker.Manager, cfg Config) *Supervisor {
 	return &Supervisor{
-		manager:  mgr,
-		config:   cfg,
-		poolMgr:  tasker.NewPoolManager(mgr),
-		stopped:  make(chan struct{}),
+		manager: mgr,
+		config:  cfg,
+		poolMgr: tasker.NewPoolManager(mgr),
+		stopped: make(chan struct{}),
 	}
 }
 
@@ -97,7 +97,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		StartedAt: time.Now(),
 		Version:   "1.0.0",
 	}
-	if err := s.manager.Driver().RegisterNode(ctx, nodeInfo, s.config.HeartbeatInterval); err != nil {
+	if err := s.manager.Driver().RegisterNode(ctx, nodeInfo, s.heartbeatTTL()); err != nil {
 		slog.Error("failed to register node", "error", err)
 	}
 
@@ -221,9 +221,13 @@ func (s *Supervisor) loop(ctx context.Context) {
 
 func (s *Supervisor) doHeartbeat(ctx context.Context) {
 	driver := s.manager.Driver()
-	if err := driver.Heartbeat(ctx, s.manager.Config().NodeID, s.config.HeartbeatInterval); err != nil {
+	if err := driver.Heartbeat(ctx, s.manager.Config().NodeID, s.heartbeatTTL()); err != nil {
 		slog.Error("heartbeat failed", "error", err)
 	}
+}
+
+func (s *Supervisor) heartbeatTTL() time.Duration {
+	return 3 * s.config.HeartbeatInterval
 }
 
 func (s *Supervisor) doRequeue(ctx context.Context) {

@@ -2,6 +2,8 @@ package tasker
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"testing"
 	"time"
 )
@@ -219,6 +221,34 @@ func (j *retryableJob) Handle(ctx context.Context) error {
 
 func (j *retryableJob) MaxAttempts() int {
 	return 10
+}
+
+type retryUntilJob struct {
+	Until time.Time
+}
+
+func (j *retryUntilJob) Handle(context.Context) error {
+	return context.DeadlineExceeded
+}
+
+func (j *retryUntilJob) RetryUntil() time.Time {
+	return j.Until
+}
+
+func TestProcessJobHonorsRetryUntil(t *testing.T) {
+	kind := "tasker.retry-until-test"
+	RegisterJob(kind, func() Job { return &retryUntilJob{} })
+	payload, err := json.Marshal(&retryUntilJob{Until: time.Now().Add(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &worker{}
+	result := w.processJob(context.Background(), &JobRow{
+		Kind: kind, Payload: payload, Attempt: 1, MaxAttempts: 3,
+	}, slog.Default())
+	if result.state != StateFailed || result.backoff != 0 {
+		t.Fatalf("retry past deadline: state=%s backoff=%s", result.state, result.backoff)
+	}
 }
 
 func TestBuildJobRow(t *testing.T) {

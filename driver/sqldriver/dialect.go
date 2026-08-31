@@ -77,7 +77,11 @@ func (d *mysqlDialect) Placeholder(n int) string { return "?" }
 func (d *mysqlDialect) SupportsSkipLocked() bool { return true }
 
 func (d *mysqlDialect) ClaimQuery(table string) string {
-	return (&postgresDialect{}).ClaimQuery(table)
+	return fmt.Sprintf(`SELECT id FROM %s
+		WHERE queue = ? AND state IN ('available', 'scheduled', 'retryable')
+		  AND scheduled_at <= ? AND attempt < max_attempts
+		ORDER BY priority DESC, scheduled_at ASC, id ASC
+		LIMIT ? FOR UPDATE SKIP LOCKED`, table)
 }
 
 func (d *mysqlDialect) ArrayType() string { return "JSON" }

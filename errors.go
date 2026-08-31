@@ -13,4 +13,5 @@ var (
 	ErrJobTimedOut        = errors.New("job execution timed out")
 	ErrJobPanicked        = errors.New("job execution panicked")
 	ErrMaxRetriesExceeded = errors.New("max retries exceeded")
+	ErrNodeNotFound       = errors.New("node not found")
 )

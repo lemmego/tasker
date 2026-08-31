@@ -257,21 +257,7 @@ func (w *worker) execute(ctx context.Context, job *JobRow) {
 		}
 
 	case StateRetryable:
-		err := w.manager.driver.Enqueue(ctx, &JobRow{
-			UUID:        job.UUID,
-			Queue:       job.Queue,
-			Kind:        job.Kind,
-			Payload:     job.Payload,
-			State:       StateRetryable,
-			Priority:    job.Priority,
-			Attempt:     job.Attempt,
-			MaxAttempts: job.MaxAttempts,
-			Tags:        job.Tags,
-			ScheduledAt: time.Now().Add(result.backoff),
-			CreatedAt:   job.CreatedAt,
-			BatchID:     job.BatchID,
-			Timeout:     job.Timeout,
-		})
+		err := w.manager.driver.ScheduleRetry(ctx, job.ID, result.err, time.Now().Add(result.backoff))
 		if err != nil {
 			logger.Error("failed to schedule retry", "error", err)
 		} else {
@@ -339,6 +325,22 @@ func (w *worker) processJob(ctx context.Context, job *JobRow, logger *slog.Logge
 
 	if execErr != nil {
 		nextState, backoff := ComputeNextState(job, execErr)
+		if nextState == StateRetryable {
+			if retry, ok := jobObj.(ShouldRetryWithBackoff); ok {
+				backoff = computeBackoffWithConfig(retry.RetryBackoff(), job.Attempt+1)
+			}
+			if retry, ok := jobObj.(ShouldRetryUntil); ok && !time.Now().Add(backoff).Before(retry.RetryUntil()) {
+				nextState = StateFailed
+				backoff = 0
+			}
+			if hook, ok := jobObj.(BeforeRetryHook); ok && nextState == StateRetryable {
+				if hookErr := hook.BeforeRetry(ctx, job.Attempt, execErr); hookErr != nil {
+					execErr = fmt.Errorf("before retry hook: %w", hookErr)
+					nextState = StateFailed
+					backoff = 0
+				}
+			}
+		}
 		return execResult{
 			state:   nextState,
 			err:     execErr,
