@@ -11,11 +11,11 @@ import (
 )
 
 type Manager struct {
-	mu         sync.RWMutex
-	driver     Driver
-	config     ManagerConfig
-	workers    map[QueueName]*Pool
-	done       chan struct{}
+	mu      sync.RWMutex
+	driver  Driver
+	config  ManagerConfig
+	workers map[QueueName]*Pool
+	done    chan struct{}
 }
 
 type ManagerConfig struct {
@@ -51,6 +51,12 @@ func WithDefaultQueue(name QueueName) ManagerOption {
 func WithMaxAttempts(n int) ManagerOption {
 	return func(m *Manager) {
 		m.config.DefaultMaxAttempts = n
+	}
+}
+
+func WithDefaultTimeout(timeout time.Duration) ManagerOption {
+	return func(m *Manager) {
+		m.config.DefaultTimeout = timeout
 	}
 }
 
@@ -252,7 +258,7 @@ func buildJobRow(job Job, cfg ManagerConfig, opts ...DispatchOpt) (*JobRow, erro
 		batchID = b.BatchID()
 	}
 
-	var timeout time.Duration
+	timeout := cfg.DefaultTimeout
 	if t, ok := job.(ShouldTimeout); ok {
 		timeout = t.Timeout()
 	}

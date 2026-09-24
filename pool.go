@@ -39,6 +39,8 @@ func (p *Pool) Start(ctx context.Context) error {
 		return fmt.Errorf("pool already running for queue %s", p.queue)
 	}
 
+	p.stop = make(chan struct{})
+	p.stopped = make(chan struct{})
 	p.running = true
 	p.workers = make([]*worker, 0, p.maxWorkers)
 
@@ -57,7 +59,7 @@ func (p *Pool) Start(ctx context.Context) error {
 		"node", p.manager.config.NodeID,
 	)
 
-	go p.watch(ctx)
+	go p.watch(p.stop, p.workers)
 
 	return nil
 }
@@ -91,10 +93,11 @@ func (p *Pool) Stop(ctx context.Context) error {
 
 	select {
 	case <-done:
+		close(p.stopped)
 	case <-ctx.Done():
+		return ctx.Err()
 	}
 
-	close(p.stopped)
 	return nil
 }
 
@@ -148,9 +151,9 @@ func (p *Pool) Queue() QueueName {
 	return p.queue
 }
 
-func (p *Pool) watch(ctx context.Context) {
-	<-p.stop
-	for _, w := range p.workers {
+func (p *Pool) watch(stop <-chan struct{}, workers []*worker) {
+	<-stop
+	for _, w := range workers {
 		w.stop()
 	}
 }

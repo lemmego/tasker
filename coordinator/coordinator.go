@@ -10,13 +10,13 @@ import (
 )
 
 type Config struct {
-	NodeID        tasker.NodeID
-	Host          string
-	Port          int
-	Queues        []tasker.QueueName
-	WorkerCount   int
-	HeartbeatTTL  time.Duration
-	LeaderTTL     time.Duration
+	NodeID       tasker.NodeID
+	Host         string
+	Port         int
+	Queues       []tasker.QueueName
+	WorkerCount  int
+	HeartbeatTTL time.Duration
+	LeaderTTL    time.Duration
 }
 
 func DefaultConfig() Config {
@@ -51,8 +51,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		return nil
 	}
 
-	c.running = true
-	ctx, c.cancel = context.WithCancel(ctx)
+	startCtx, cancel := context.WithCancel(ctx)
 
 	nodeInfo := tasker.NodeInfo{
 		ID:        c.config.NodeID,
@@ -65,11 +64,15 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		Version:   "1.0.0",
 	}
 
-	if err := c.manager.Driver().RegisterNode(ctx, nodeInfo, c.config.HeartbeatTTL); err != nil {
+	if err := c.manager.Driver().RegisterNode(startCtx, nodeInfo, c.config.HeartbeatTTL); err != nil {
+		cancel()
 		return err
 	}
 
-	go c.loop(ctx)
+	c.running = true
+	c.cancel = cancel
+	c.stopped = make(chan struct{})
+	go c.loop(startCtx)
 
 	slog.Info("coordinator started", "node", c.config.NodeID)
 
@@ -85,7 +88,9 @@ func (c *Coordinator) Stop(ctx context.Context) error {
 	}
 
 	c.running = false
-	c.cancel()
+	if c.cancel != nil {
+		c.cancel()
+	}
 
 	if err := c.manager.Driver().DeregisterNode(ctx, c.config.NodeID); err != nil {
 		slog.Error("failed to deregister node", "error", err)

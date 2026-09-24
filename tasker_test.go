@@ -213,6 +213,63 @@ func (j *delayedJob) Delay() time.Duration {
 	return 5 * time.Minute
 }
 
+type poolTestDriver struct{}
+
+func (poolTestDriver) Enqueue(context.Context, *JobRow) error        { return nil }
+func (poolTestDriver) EnqueueBatch(context.Context, []*JobRow) error { return nil }
+func (poolTestDriver) Claim(context.Context, QueueName, NodeID, int) ([]*JobRow, error) {
+	return nil, nil
+}
+func (poolTestDriver) Complete(context.Context, JobID, []byte) error                { return nil }
+func (poolTestDriver) Fail(context.Context, JobID, error) error                     { return nil }
+func (poolTestDriver) ScheduleRetry(context.Context, JobID, error, time.Time) error { return nil }
+func (poolTestDriver) Retry(context.Context, JobID) (*JobRow, error)                { return nil, nil }
+func (poolTestDriver) RetryBatch(context.Context, []JobID) error                    { return nil }
+func (poolTestDriver) Cancel(context.Context, JobID) (*JobRow, error)               { return nil, nil }
+func (poolTestDriver) CancelBatch(context.Context, []JobID) error                   { return nil }
+func (poolTestDriver) GetByID(context.Context, JobID) (*JobRow, error)              { return nil, nil }
+func (poolTestDriver) QueryJobs(context.Context, JobFilter) ([]*JobRow, int64, error) {
+	return nil, 0, nil
+}
+func (poolTestDriver) QueueStats(context.Context, QueueName) (*QueueStats, error)  { return nil, nil }
+func (poolTestDriver) GlobalStats(context.Context) (*GlobalStats, error)           { return nil, nil }
+func (poolTestDriver) JobStats(context.Context, string) (*JobTypeStats, error)     { return nil, nil }
+func (poolTestDriver) Ping(context.Context) error                                  { return nil }
+func (poolTestDriver) Close() error                                                { return nil }
+func (poolTestDriver) RegisterNode(context.Context, NodeInfo, time.Duration) error { return nil }
+func (poolTestDriver) DeregisterNode(context.Context, NodeID) error                { return nil }
+func (poolTestDriver) Heartbeat(context.Context, NodeID, time.Duration) error      { return nil }
+func (poolTestDriver) ListNodes(context.Context) ([]NodeInfo, error)               { return nil, nil }
+func (poolTestDriver) LeaderElection(context.Context, NodeID, time.Duration) (bool, error) {
+	return false, nil
+}
+func (poolTestDriver) IsLeader(context.Context, NodeID) (bool, error) { return false, nil }
+func (poolTestDriver) ResignLeadership(context.Context, NodeID) error { return nil }
+func (poolTestDriver) AcquireLock(context.Context, string, NodeID, time.Duration) (bool, error) {
+	return false, nil
+}
+func (poolTestDriver) ReleaseLock(context.Context, string, NodeID) error          { return nil }
+func (poolTestDriver) RequeueStale(context.Context, time.Duration) (int64, error) { return 0, nil }
+func (poolTestDriver) Prune(context.Context, time.Time, []State) (int64, error)   { return 0, nil }
+
+func TestPoolCanRestartAfterStop(t *testing.T) {
+	mgr := NewManager(WithDriver(poolTestDriver{}), WithNodeID("test-node"))
+	p := NewPool(mgr, "default", 1)
+
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type retryableJob struct{}
 
 func (j *retryableJob) Handle(ctx context.Context) error {
@@ -253,6 +310,7 @@ func TestProcessJobHonorsRetryUntil(t *testing.T) {
 
 func TestBuildJobRow(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.DefaultTimeout = 3 * time.Second
 
 	t.Run("basic job", func(t *testing.T) {
 		row, err := buildJobRow(&testJob{ID: "1"}, cfg)
@@ -331,6 +389,16 @@ func TestBuildJobRow(t *testing.T) {
 		}
 		if len(row.Tags) != 1 || row.Tags[0] != "custom" {
 			t.Errorf("expected [custom] tags, got %v", row.Tags)
+		}
+	})
+
+	t.Run("default timeout", func(t *testing.T) {
+		row, err := buildJobRow(&testJob{ID: "timeout"}, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.Timeout != cfg.DefaultTimeout {
+			t.Fatalf("timeout = %s, want %s", row.Timeout, cfg.DefaultTimeout)
 		}
 	})
 }

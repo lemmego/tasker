@@ -25,6 +25,8 @@ type Scheduler struct {
 	cron     *cron.Cron
 	entryIDs map[string]cron.EntryID
 	running  bool
+	cancel   context.CancelFunc
+	ctx      context.Context
 }
 
 func New(mgr *tasker.Manager) *Scheduler {
@@ -50,6 +52,7 @@ func (s *Scheduler) Register(job ScheduledJob) error {
 		s.dispatchJob(job)
 	})
 	if err != nil {
+		delete(s.jobs, job.ID)
 		return err
 	}
 
@@ -77,6 +80,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 		return nil
 	}
 
+	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.running = true
 	s.cron.Start()
 
@@ -93,8 +97,13 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 	}
 
 	s.running = false
-	ctx = s.cron.Stop()
-	<-ctx.Done()
+	s.cancel()
+	stopped := s.cron.Stop()
+	select {
+	case <-stopped.Done():
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	slog.Info("scheduler stopped")
 	return nil
@@ -111,7 +120,12 @@ func (s *Scheduler) List() []ScheduledJob {
 }
 
 func (s *Scheduler) dispatchJob(job ScheduledJob) {
-	ctx := context.Background()
+	s.mu.Lock()
+	ctx := s.ctx
+	s.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	opts := append([]tasker.DispatchOpt{
 		tasker.OnQueue(job.Queue),
 	}, job.Opts...)

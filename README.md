@@ -194,6 +194,11 @@ redisdriver.Config{
 
 ## Web UI API Endpoints
 
+Management routes are disabled by default. Before mounting the handler, install
+an explicit authentication middleware with `server.UseAuth(...)`. For browser
+session authentication, also call `server.UseCSRF()`; state-changing requests
+must then send the `X-CSRF-Token` header matching the `tasker_csrf` cookie.
+
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/tasker/` | Dashboard HTML |

@@ -1,10 +1,10 @@
 package tasker
 
 type Config struct {
-	Driver         Driver
-	DefaultQueue   QueueName
+	Driver             Driver
+	DefaultQueue       QueueName
 	DefaultMaxAttempts int
-	NodeID         NodeID
+	NodeID             NodeID
 }
 
 func DefaultAppConfig() Config {

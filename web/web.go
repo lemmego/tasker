@@ -1,6 +1,8 @@
 package web
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -18,6 +20,7 @@ type Server struct {
 	mux         *http.ServeMux
 	middlewares []func(http.Handler) http.Handler
 	prefix      string
+	authEnabled bool
 }
 
 func New(mgr *tasker.Manager, sup *supervisor.Supervisor) *Server {
@@ -39,8 +42,28 @@ func (s *Server) Use(mw func(http.Handler) http.Handler) {
 	s.middlewares = append(s.middlewares, mw)
 }
 
+// UseAuth installs the middleware responsible for authenticating management
+// requests. Management routes remain disabled until this method is called.
+// The middleware may reject requests, redirect them, or attach its own user
+// identity to the request context.
+func (s *Server) UseAuth(mw func(http.Handler) http.Handler) {
+	s.authEnabled = true
+	s.Use(mw)
+}
+
+// UseCSRF protects state-changing management requests with a double-submit
+// token. It is intended to be used alongside UseAuth for browser sessions.
+func (s *Server) UseCSRF() {
+	s.Use(csrfMiddleware)
+}
+
 func (s *Server) Handler() http.Handler {
 	var h http.Handler = s.mux
+	if !s.authEnabled {
+		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, http.StatusUnauthorized, "tasker management authentication is not configured")
+		})
+	}
 	for i := len(s.middlewares) - 1; i >= 0; i-- {
 		h = s.middlewares[i](h)
 	}
@@ -131,9 +154,9 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"data":  jobs,
-		"total": total,
-		"limit": filter.Limit,
+		"data":   jobs,
+		"total":  total,
+		"limit":  filter.Limit,
 		"offset": filter.Offset,
 	})
 }
@@ -227,9 +250,9 @@ func (s *Server) handleBatchCancel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
 	queues := s.supervisor.Queues()
 	type queueInfo struct {
-		Name   tasker.QueueName  `json:"name"`
+		Name   tasker.QueueName   `json:"name"`
 		Stats  *tasker.QueueStats `json:"stats"`
-		Paused bool              `json:"paused"`
+		Paused bool               `json:"paused"`
 	}
 
 	var result []queueInfo
@@ -312,13 +335,13 @@ func (s *Server) handleJobMetrics(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleQueueMetrics(w http.ResponseWriter, r *http.Request) {
 	type metric struct {
-		Queue          tasker.QueueName `json:"queue"`
-		Throughput     float64          `json:"throughput_per_min"`
-		AvgRuntime     float64          `json:"avg_runtime_ms"`
-		Available      int64            `json:"available"`
-		Running        int64            `json:"running"`
-		Completed      int64            `json:"completed"`
-		Failed         int64            `json:"failed"`
+		Queue      tasker.QueueName `json:"queue"`
+		Throughput float64          `json:"throughput_per_min"`
+		AvgRuntime float64          `json:"avg_runtime_ms"`
+		Available  int64            `json:"available"`
+		Running    int64            `json:"running"`
+		Completed  int64            `json:"completed"`
+		Failed     int64            `json:"failed"`
 	}
 
 	var result []metric
@@ -405,4 +428,52 @@ func parseID(s string) (tasker.JobID, error) {
 		return 0, err
 	}
 	return tasker.JobID(n), nil
+}
+
+const csrfCookieName = "tasker_csrf"
+
+func csrfMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			if _, err := r.Cookie(csrfCookieName); err != nil {
+				token, err := newCSRFToken()
+				if err != nil {
+					writeError(w, http.StatusInternalServerError, "could not create csrf token")
+					return
+				}
+				http.SetCookie(w, &http.Cookie{
+					Name:     csrfCookieName,
+					Value:    token,
+					Path:     "/",
+					HttpOnly: false,
+					SameSite: http.SameSiteStrictMode,
+				})
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		cookie, err := r.Cookie(csrfCookieName)
+		provided := r.Header.Get("X-CSRF-Token")
+		if err != nil || provided == "" || !secureStringEqual(cookie.Value, provided) {
+			writeError(w, http.StatusForbidden, "invalid csrf token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func newCSRFToken() (string, error) {
+	token := make([]byte, 32)
+	if _, err := rand.Read(token); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", token), nil
+}
+
+func secureStringEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }

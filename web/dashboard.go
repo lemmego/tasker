@@ -125,7 +125,11 @@ tr.clickable:hover { background:#1e293b; }
 function toast(msg) { var t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(function(){t.classList.remove('show');},2500); }
 
 async function post(url, body) {
-	var r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:body?JSON.stringify(body):undefined});
+	var token = document.cookie.split('; ').find(function(c){return c.indexOf('tasker_csrf=')===0;});
+	token = token ? decodeURIComponent(token.substring('tasker_csrf='.length)) : '';
+	var headers = {'Content-Type':'application/json'};
+	if (token) headers['X-CSRF-Token'] = token;
+	var r = await fetch(url, {method:'POST', headers:headers, body:body?JSON.stringify(body):undefined});
 	if (!r.ok) { var e=await r.json(); throw new Error(e.error||r.statusText); }
 	return r.json();
 }
