@@ -13,6 +13,22 @@ import (
 )
 
 type Config struct {
+	// DB is an already-open pool to run against. When it is set the driver
+	// borrows it: DSN, DriverName and the pool-sizing fields are ignored,
+	// and Close leaves the pool alone because whoever opened it owns it.
+	//
+	// This is how the queue shares the application's connection instead of
+	// re-deriving a DSN and opening a second one. Two independent readings
+	// of one configuration tree drift, and when they did, the queue ran
+	// against a different database and lost every job on restart.
+	DB *sql.DB
+
+	// Dialect names the SQL flavour of DB. It is required alongside DB,
+	// since a borrowed pool carries no driver name to infer it from — and
+	// for a pool opened through a connector rather than sql.Open, there may
+	// be no registered driver name at all.
+	Dialect string
+
 	DSN             string
 	DriverName      string
 	MaxOpenConns    int
@@ -35,6 +51,10 @@ type Driver struct {
 	db      *sql.DB
 	config  Config
 	dialect Dialect
+
+	// borrowed records that the pool came from Config.DB, so Close does not
+	// shut down a connection the rest of the application is still using.
+	borrowed bool
 }
 
 const jobColumns = `id, uuid, queue, kind, payload, state, priority, attempt, max_attempts,
@@ -45,6 +65,23 @@ func NewDriver(cfg Config) (*Driver, error) {
 	if !validIdentifierPrefix(cfg.TablePrefix) {
 		return nil, fmt.Errorf("invalid table prefix %q", cfg.TablePrefix)
 	}
+
+	if cfg.DB != nil {
+		if cfg.Dialect == "" {
+			return nil, fmt.Errorf("sqldriver: Config.DB was given without a Dialect; " +
+				"a borrowed pool carries no driver name to infer one from")
+		}
+		if err := cfg.DB.Ping(); err != nil {
+			return nil, fmt.Errorf("failed to ping the borrowed database: %w", err)
+		}
+		return &Driver{
+			db:       cfg.DB,
+			config:   cfg,
+			dialect:  dialectFor(cfg.Dialect),
+			borrowed: true,
+		}, nil
+	}
+
 	db, err := sql.Open(cfg.DriverName, cfg.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -106,7 +143,13 @@ func (d *Driver) Ping(ctx context.Context) error {
 	return d.db.PingContext(ctx)
 }
 
+// Close shuts down the pool, unless it was borrowed. Closing a pool the
+// application opened would take the rest of the application down with the
+// queue, so a borrowed pool is left to its owner.
 func (d *Driver) Close() error {
+	if d.borrowed {
+		return nil
+	}
 	return d.db.Close()
 }
 
