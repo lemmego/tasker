@@ -60,8 +60,27 @@ func WithDefaultTimeout(timeout time.Duration) ManagerOption {
 	}
 }
 
+// WithNodeID sets the manager's node identity.
+//
+// An empty id is ignored rather than applied, and that is the whole point.
+// The node id is the owner token for the leader lease, for every
+// mutual-exclusion lock and for job claims — so "" is not a weaker identity,
+// it is the *same* identity in every process. The compare-and-renew script
+// then reads owner == "" as "this is mine" for everybody: every process wins
+// the leader lease at once, every process can release every other's locks,
+// and the whole deployment shares one heartbeat key, which the first shutdown
+// deletes for all of them. After that each survivor's heartbeat fails forever
+// with "node not found", because registration only happens at boot.
+//
+// NewConfiguredManager passes whatever a caller's Config carries, and a
+// Config assembled field by field carries "" unless someone remembered this
+// one — which is how a real deployment arrived here. DefaultConfig already
+// generates a unique id; the fix is to stop overwriting it with nothing.
 func WithNodeID(id NodeID) ManagerOption {
 	return func(m *Manager) {
+		if id == "" {
+			return
+		}
 		m.config.NodeID = id
 	}
 }
