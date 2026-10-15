@@ -264,7 +264,12 @@ func (w *worker) execute(ctx context.Context, job *JobRow) {
 		if err != nil {
 			logger.Error("failed to schedule retry", "error", err)
 		} else {
-			logger.Debug("job scheduled for retry", "backoff", result.backoff, "attempt", job.Attempt)
+			// Info, not Debug: a job that failed and will be tried again is
+			// the ordinary running commentary of a queue, and a deployment
+			// that cannot see its retries cannot tell a slow dependency from
+			// a stuck one.
+			logger.Info("job scheduled for retry",
+				"backoff", result.backoff, "attempt", job.Attempt, "error", result.err)
 		}
 
 	case StateFailed:
@@ -272,7 +277,14 @@ func (w *worker) execute(ctx context.Context, job *JobRow) {
 		if err != nil {
 			logger.Error("failed to mark job failed", "error", err)
 		} else {
-			logger.Info("job failed permanently", "error", result.err)
+			// Error, not Info. This is work the system accepted and will now
+			// never do, and the attached error is the only record of why.
+			// Info put it below the level a worker prints on a container
+			// platform — api/logger raises a command's console to warn — so
+			// the dashboard showed jobs cycling while the deployment's log
+			// stayed empty.
+			logger.Error("job failed permanently", "error", result.err,
+				"attempt", job.Attempt, "max_attempts", job.MaxAttempts)
 		}
 
 		w.callFailedHook(ctx, job, result.err)
