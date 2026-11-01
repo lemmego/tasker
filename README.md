@@ -155,6 +155,49 @@ type AfterHandleHook interface { AfterHandle(ctx) error }
 type BeforeRetryHook interface { BeforeRetry(ctx, attempt, err) error }
 ```
 
+## Watching enqueues and scheduled runs
+
+`AddGlobalMiddleware` wraps a job's **execution**. Two other things are
+observable, and they are different questions:
+
+```go
+// Every enqueue, process-wide — Dispatch, DispatchBatch and Chain.
+tasker.AddDispatchMiddleware(func(ctx context.Context, rows []*tasker.JobRow,
+    next func(context.Context) error) error {
+    for _, row := range rows {
+        row.Metadata["request_id"] = requestIDFrom(ctx) // stamp before sending
+    }
+    return next(ctx)
+})
+
+// Every scheduled firing.
+sched.Observe(func(ctx context.Context, run scheduler.Run) {
+    slog.InfoContext(ctx, "scheduled", "id", run.ID, "err", run.Err)
+})
+```
+
+A dispatch middleware is handed the rows **before** they are sent, and
+writing to them is allowed: `Metadata` is how a job carries the id of the
+request that queued it, which is what makes an enqueue here and an execution
+in a worker process the same story. Returning without calling `next` refuses
+the enqueue and the error reaches the caller of `Dispatch`, so a middleware
+meant only to watch must call `next` and return its error unchanged. Index 0
+is outermost, as with `JobMiddleware`.
+
+Without it, enqueue is invisible: execution middleware only sees a job run,
+so a job that was queued and never picked up is indistinguishable from a job
+nobody queued — which is the difference between "no worker is running" and
+"the dispatch call is not being reached".
+
+`scheduler.Run` is reported separately because a job row answers nothing a
+schedule is asked: whether 4:20 fired, whether it fired twice, how long it
+has been failing. And a run that **failed to enqueue** leaves no row at all,
+so without the listener it did not happen as far as the queue is concerned.
+
+Both contain a listener's panic. The scheduler's matters most: its cron has
+no recovery chain, so a panic on the firing goroutine would take down the one
+process that runs every scheduled job in the deployment.
+
 ## Job States
 
 ```

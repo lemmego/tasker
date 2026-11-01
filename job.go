@@ -148,3 +148,24 @@ func WithMetadata(k, v string) DispatchOpt {
 }
 
 type JobMiddleware func(ctx context.Context, job Job, payload []byte, next func(ctx context.Context) error) error
+
+// DispatchMiddleware wraps an enqueue, the way JobMiddleware wraps an
+// execution.
+//
+// Until this existed, enqueue was not observable at all: AddGlobalMiddleware
+// sees a job run, so a job that was queued and never picked up was
+// indistinguishable from a job nobody queued — which is the difference
+// between "no worker is running" and "the dispatch call is not being
+// reached", and the most common question asked about a queue.
+//
+// The rows are handed over before they are sent, and writing to them is
+// allowed. Metadata is how a job carries the id of the request that queued
+// it, which is what makes an enqueue and its execution in another process
+// the same story; a hook that only reported the outcome could not put it
+// there.
+//
+// Returning an error without calling next refuses the enqueue, and the error
+// reaches the caller of Dispatch. That is real power, so it is written down:
+// a middleware meant only to watch must call next and return its error
+// unchanged.
+type DispatchMiddleware func(ctx context.Context, rows []*JobRow, next func(ctx context.Context) error) error

@@ -11,6 +11,9 @@ var (
 	jobRegistryMu     sync.RWMutex
 	globalMiddlewares []JobMiddleware
 	middlewareMu      sync.RWMutex
+
+	dispatchMiddlewares []DispatchMiddleware
+	dispatchMu          sync.RWMutex
 )
 
 func RegisterJob(name string, factory JobFactory) {
@@ -53,5 +56,38 @@ func GetGlobalMiddlewares() []JobMiddleware {
 	defer middlewareMu.RUnlock()
 	mws := make([]JobMiddleware, len(globalMiddlewares))
 	copy(mws, globalMiddlewares)
+	return mws
+}
+
+// AddDispatchMiddleware installs a middleware around every enqueue, for the
+// whole process. Additive, like AddGlobalMiddleware.
+//
+// Process-wide rather than per-Manager, matching the execution side, because
+// an observer wants every enqueue including the ones made through
+// tasker.Global(). The cost is that it is global state a test can leave
+// behind, which is what SetDispatchMiddlewares(nil) is for.
+func AddDispatchMiddleware(mw DispatchMiddleware) {
+	if mw == nil {
+		return
+	}
+	dispatchMu.Lock()
+	defer dispatchMu.Unlock()
+	dispatchMiddlewares = append(dispatchMiddlewares, mw)
+}
+
+// SetDispatchMiddlewares replaces the installed set. Passing nil clears it,
+// which is how a test stops leaking into the next one.
+func SetDispatchMiddlewares(mws []DispatchMiddleware) {
+	dispatchMu.Lock()
+	defer dispatchMu.Unlock()
+	dispatchMiddlewares = mws
+}
+
+// GetDispatchMiddlewares returns a copy of the installed set.
+func GetDispatchMiddlewares() []DispatchMiddleware {
+	dispatchMu.RLock()
+	defer dispatchMu.RUnlock()
+	mws := make([]DispatchMiddleware, len(dispatchMiddlewares))
+	copy(mws, dispatchMiddlewares)
 	return mws
 }

@@ -125,7 +125,10 @@ func (m *Manager) Dispatch(ctx context.Context, job Job, opts ...DispatchOpt) (*
 	if err != nil {
 		return nil, err
 	}
-	if err := m.driver.Enqueue(ctx, row); err != nil {
+	rows := []*JobRow{row}
+	if err := m.enqueue(ctx, rows, func(ctx context.Context) error {
+		return m.driver.Enqueue(ctx, row)
+	}); err != nil {
 		return nil, err
 	}
 	return row, nil
@@ -140,10 +143,36 @@ func (m *Manager) DispatchBatch(ctx context.Context, jobs []Job, opts ...Dispatc
 		}
 		rows = append(rows, row)
 	}
-	if err := m.driver.EnqueueBatch(ctx, rows); err != nil {
+	if err := m.enqueue(ctx, rows, func(ctx context.Context) error {
+		return m.driver.EnqueueBatch(ctx, rows)
+	}); err != nil {
 		return nil, err
 	}
 	return rows, nil
+}
+
+// enqueue runs the dispatch middleware around the driver call.
+//
+// Every enqueue path goes through here — Dispatch, DispatchBatch and Chain —
+// because a middleware installed to watch enqueues and missing one of the
+// three is worse than no middleware at all: the gap is silent, and a job that
+// was never seen being queued looks like a job the worker invented.
+//
+// The rows are passed before they are sent, so a middleware can write to
+// them. That is the point rather than a side effect: Metadata is how a job
+// carries the id of the request that queued it, and a hook that only saw the
+// outcome could not put it there. Index 0 is outermost, matching the
+// execution middleware in pool.go.
+func (m *Manager) enqueue(ctx context.Context, rows []*JobRow, send func(context.Context) error) error {
+	middlewares := GetDispatchMiddlewares()
+	next := send
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		mw, inner := middlewares[i], next
+		next = func(ctx context.Context) error {
+			return mw(ctx, rows, inner)
+		}
+	}
+	return next(ctx)
 }
 
 func (m *Manager) Chain(ctx context.Context, jobs []Job, opts ...DispatchOpt) ([]*JobRow, error) {
@@ -165,7 +194,9 @@ func (m *Manager) Chain(ctx context.Context, jobs []Job, opts ...DispatchOpt) ([
 		}
 		rows = append(rows, row)
 	}
-	if err := m.driver.EnqueueBatch(ctx, rows); err != nil {
+	if err := m.enqueue(ctx, rows, func(ctx context.Context) error {
+		return m.driver.EnqueueBatch(ctx, rows)
+	}); err != nil {
 		return nil, err
 	}
 	return rows, nil
