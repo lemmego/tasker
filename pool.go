@@ -299,6 +299,11 @@ func (w *worker) processJob(ctx context.Context, job *JobRow, logger *slog.Logge
 
 	middlewares := w.collectMiddlewares(jobObj)
 
+	// Before the middleware chain is built, so a JobMiddleware and the job's
+	// own Handle can both reach the row. Metadata is the only thing that
+	// travels from the process that queued the job to this one.
+	ctx = ContextWithRow(ctx, job)
+
 	var execErr error
 
 	runFunc := func(ctx context.Context) error {

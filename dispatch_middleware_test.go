@@ -3,6 +3,7 @@ package tasker
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 )
 
@@ -240,5 +241,57 @@ func TestAnEnqueueWorksWithNoMiddleware(t *testing.T) {
 	}
 	if len(driver.sent) != 1 {
 		t.Errorf("the driver received %d rows, want 1", len(driver.sent))
+	}
+}
+
+// The round trip that is the whole point of both halves: a dispatch
+// middleware writes to Metadata, and the execution side reads it back off the
+// context.
+//
+// Asserted through the real worker rather than by calling ContextWithRow
+// directly, because what is under test is that the worker installs it before
+// the middleware chain runs — a ContextWithRow nobody calls proves nothing.
+func TestAStampWrittenAtDispatchIsReadableAtExecution(t *testing.T) {
+	clearDispatch(t)
+
+	kind := "tasker.dispatch-roundtrip-test"
+	RegisterJob(kind, func() Job { return &dispatchTestJob{} })
+
+	AddDispatchMiddleware(func(ctx context.Context, rows []*JobRow, next func(context.Context) error) error {
+		for _, row := range rows {
+			if row.Metadata == nil {
+				row.Metadata = map[string]string{}
+			}
+			row.Metadata["request_id"] = "req-7"
+		}
+		return next(ctx)
+	})
+
+	driver := &recordingDriver{}
+	manager := NewManager(WithDriver(driver), WithNodeID("test-node"))
+	row, err := manager.Dispatch(context.Background(), &dispatchTestJob{Name: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.Kind = kind
+
+	var seen string
+	SetGlobalMiddlewares([]JobMiddleware{
+		func(ctx context.Context, _ Job, _ []byte, next func(context.Context) error) error {
+			if executing, ok := RowFromContext(ctx); ok {
+				seen = executing.Metadata["request_id"]
+			}
+			return next(ctx)
+		},
+	})
+	t.Cleanup(func() { SetGlobalMiddlewares(nil) })
+
+	worker := &worker{manager: manager}
+	if result := worker.processJob(context.Background(), row, slog.Default()); result.err != nil {
+		t.Fatalf("running the job: %v", result.err)
+	}
+
+	if seen != "req-7" {
+		t.Errorf("the execution side read %q off the row, want the id stamped at dispatch", seen)
 	}
 }

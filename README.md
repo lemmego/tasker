@@ -184,6 +184,13 @@ the enqueue and the error reaches the caller of `Dispatch`, so a middleware
 meant only to watch must call `next` and return its error unchanged. Index 0
 is outermost, as with `JobMiddleware`.
 
+The two halves meet through the row. `tasker.RowFromContext(ctx)` returns the
+row being executed, installed by the worker **before** any middleware runs —
+so the id a dispatch middleware wrote into `Metadata` is readable in the
+process that runs the job. `JobMiddleware` is handed the decoded job and the
+raw payload, neither of which carries `Metadata`, and the two halves happen in
+different processes, so the row is the only thing that travels.
+
 Without it, enqueue is invisible: execution middleware only sees a job run,
 so a job that was queued and never picked up is indistinguishable from a job
 nobody queued — which is the difference between "no worker is running" and
