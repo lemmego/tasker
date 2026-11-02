@@ -219,27 +219,38 @@ function renderOverview(){
         fig('Jobs / minute', num(s.jobs_per_minute), '', '') +
         fig('Recent jobs', num(s.recent_jobs), 'last hour', '') +
         fig('Failed', num(s.failed_jobs), 'needs attention', s.failed_jobs > 0 ? 'bad' : 'ok') +
-        fig('Processes', num(s.processes), workers.length === 0 ? 'none reporting' : '',
-            s.processes > 0 ? 'ok' : 'bad') +
+        fig('Processes', num(workers.length),
+            workers.length === 0 ? 'none reporting' : '',
+            workers.length > 0 ? 'ok' : 'bad') +
         fig('Paused', num(s.paused_masters), paused ? 'queues held' : '', paused ? 'warn' : '');
 
       var html = '<div class="cards">' + figures + '</div>';
 
       /* The one notice worth interrupting for. A queue with work and no
        * worker is the failure that looks like nothing at all: jobs pile up,
-       * nothing errors, and every log line is about something else. */
+       * nothing errors, and every log line is about something else.
+       *
+       * Decided from the workers list and never from stats.processes, which
+       * is the same answer arrived at twice. This used to read processes,
+       * and it printed "No worker is reporting" directly above a table
+       * listing a worker whose heartbeat was seconds old — a dashboard
+       * contradicting itself one element later, which is worse than saying
+       * nothing. tasker's own Processes was counting *busy* nodes rather
+       * than live ones and is fixed, but the rule stands whatever that
+       * field does: a claim and the evidence under it come from one source.
+       */
       var waiting = 0;
       for (var i = 0; i < queues.length; i++) {
         var qs = queues[i].stats || {};
         waiting += (qs.available || 0) + (qs.running || 0);
       }
-      if (waiting > 0 && s.processes === 0) {
-        html = '<div class="note bad">' + num(waiting) + ' job' + (waiting === 1 ? '' : 's') +
-          ' waiting and no worker is reporting. Start one with ' +
-          '<code>lemmego run tasker:work</code>.</div>' + html;
-      } else if (s.processes === 0) {
-        html = '<div class="note warn">No worker is reporting. Nothing will run until one ' +
-          'starts: <code>lemmego run tasker:work</code>.</div>' + html;
+      if (workers.length === 0) {
+        html = (waiting > 0
+          ? '<div class="note bad">' + num(waiting) + ' job' + (waiting === 1 ? '' : 's') +
+            ' waiting and no worker is reporting. Start one with ' +
+            '<code>lemmego run tasker:work</code>.</div>'
+          : '<div class="note warn">No worker is reporting. Nothing will run until one ' +
+            'starts: <code>lemmego run tasker:work</code>.</div>') + html;
       }
 
       html += '<div class="card"><h2>Queues</h2>' + queueTable(queues, true) + '</div>';
@@ -458,9 +469,15 @@ function workerTable(workers){
     /* A heartbeat is the only thing that says a worker is alive, so a stale
      * one is shown as stale rather than as the status it last claimed. The
      * row would otherwise say "active" about a process that died an hour
-     * ago, which is the single most misleading thing this table could do. */
+     * ago, which is the single most misleading thing this table could do.
+     *
+     * The threshold matches tasker.NodeLivenessWindow, which is what the
+     * driver already filters on — so for the drivers in this repository a
+     * listed node is live by construction and this never fires. It is kept
+     * for the case it is there for: a driver that returns what it has and
+     * lets the reader judge. Two seconds of slack for the round trip. */
     var since = (Date.now() - Date.parse(n.last_heartbeat))/1000;
-    var stale = !(since < 90);
+    var stale = !(since < 32);
     rows += '<tr class="' + (stale ? 'warn' : '') + '">' +
       '<td class="mono">' + esc(n.id) + '</td>' +
       '<td>' + esc(n.host) + (n.port ? ':' + esc(n.port) : '') + '</td>' +

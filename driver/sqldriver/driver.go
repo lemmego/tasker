@@ -929,8 +929,27 @@ func (d *Driver) GlobalStats(ctx context.Context) (*tasker.GlobalStats, error) {
 	stats.FailedJobs = failedJobs
 	stats.RecentJobs = recentJobs
 
+	// Live nodes, not busy ones.
+	//
+	// This counted DISTINCT node_id over jobs in the running state, so a
+	// worker that was up and idle — which is what a healthy worker is almost
+	// all the time — counted zero. The field is named Processes and was
+	// measuring "nodes executing something this instant", and a dashboard
+	// reading it said "no worker is reporting" directly above a table
+	// listing a worker whose heartbeat was seconds old.
+	//
+	// Same predicate as ListNodes, through the same constant, because the
+	// two answering differently is the bug rather than a detail of it.
 	var processes int
-	d.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COALESCE(COUNT(DISTINCT node_id), 0) FROM %s WHERE state = 'running'`, d.table("jobs"))).Scan(&processes)
+	if err := d.db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT COALESCE(COUNT(*), 0) FROM %s WHERE last_heartbeat > %s`,
+		d.table("nodes"), d.dialect.Placeholder(1)),
+		time.Now().Add(-tasker.NodeLivenessWindow)).Scan(&processes); err != nil {
+		// Not fatal: the job figures above are already read and are worth
+		// more than this one. A zero here reads as "no workers", which is
+		// what a failed read means anyway.
+		processes = 0
+	}
 	stats.Processes = processes
 
 	return stats, nil
@@ -1026,7 +1045,7 @@ func (d *Driver) ListNodes(ctx context.Context) ([]tasker.NodeInfo, error) {
 		WHERE last_heartbeat > %s
 		ORDER BY started_at`, d.table("nodes"), d.dialect.Placeholder(1))
 
-	rows, err := d.db.QueryContext(ctx, query, time.Now().Add(-30*time.Second))
+	rows, err := d.db.QueryContext(ctx, query, time.Now().Add(-tasker.NodeLivenessWindow))
 	if err != nil {
 		return nil, err
 	}

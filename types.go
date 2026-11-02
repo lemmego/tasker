@@ -124,3 +124,17 @@ type NodeInfo struct {
 	LastHeartbeat time.Time   `json:"last_heartbeat"`
 	Version       string      `json:"version"`
 }
+
+// NodeLivenessWindow is how recently a node must have reported to count as
+// alive.
+//
+// One constant because two answers to "is this worker up" is a dashboard
+// contradicting itself: ListNodes filtered on a locally-written 30 seconds
+// while GlobalStats.Processes counted DISTINCT node_id over *running jobs* —
+// so an idle worker, which is what a healthy worker is almost all the time,
+// made the overview say "no worker is reporting" directly above a table
+// listing that worker with a heartbeat seconds old.
+//
+// Three times the supervisor's default heartbeat interval, so one missed beat
+// is not an outage.
+const NodeLivenessWindow = 30 * time.Second

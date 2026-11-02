@@ -480,7 +480,6 @@ func (d *Driver) GlobalStats(ctx context.Context) (*tasker.GlobalStats, error) {
 	}
 	stats := &tasker.GlobalStats{Status: "running"}
 	now := time.Now()
-	processes := map[tasker.NodeID]struct{}{}
 	for _, job := range jobs {
 		if job.CreatedAt.After(now.Add(-time.Hour)) {
 			stats.RecentJobs++
@@ -491,11 +490,24 @@ func (d *Driver) GlobalStats(ctx context.Context) (*tasker.GlobalStats, error) {
 		if job.FinalizedAt != nil && job.FinalizedAt.After(now.Add(-time.Minute)) && (job.State == tasker.StateCompleted || job.State == tasker.StateFailed) {
 			stats.JobsPerMinute++
 		}
-		if job.State == tasker.StateRunning && job.NodeID != "" {
-			processes[job.NodeID] = struct{}{}
-		}
 	}
-	stats.Processes = len(processes)
+
+	// Live nodes, not busy ones.
+	//
+	// This counted distinct node ids over jobs in the running state, so a
+	// worker that was up and idle — which is what a healthy worker is almost
+	// all the time — counted zero, and a dashboard reading it said "no
+	// worker is reporting" above a table listing that worker. The node
+	// registry is the thing that knows, and ListNodes already reads it.
+	nodes, err := d.ListNodes(ctx)
+	if err != nil {
+		// Not fatal: the job figures above are already read and are worth
+		// more than this one. Zero reads as "no workers", which is what a
+		// failed read means anyway.
+		stats.Processes = 0
+		return stats, nil
+	}
+	stats.Processes = len(nodes)
 	return stats, nil
 }
 
