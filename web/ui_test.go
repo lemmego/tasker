@@ -449,3 +449,66 @@ func TestAStateChangingRequestWithoutATokenIsRefused(t *testing.T) {
 		t.Error("a POST carrying the issued token was still refused")
 	}
 }
+
+// TestTheCSRFCookieIsScopedToTheDashboard.
+//
+// It used to be written at "/", so it rode along on every request to the
+// host application — every page, every API call, every asset — to be read by
+// nothing, since only this dashboard's script looks at it.
+func TestTheCSRFCookieIsScopedToTheDashboard(t *testing.T) {
+	s := NewWithPrefix(tasker.NewManager(tasker.WithDriver(&stubDriver{})), nil, "/tasker")
+	s.UseAuth(func(next http.Handler) http.Handler { return next })
+	s.UseCSRF()
+
+	res := httptest.NewRecorder()
+	s.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/tasker/", nil))
+
+	var cookie *http.Cookie
+	for _, c := range res.Result().Cookies() {
+		if c.Name == csrfCookieName {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatal("no csrf cookie was issued")
+	}
+	if cookie.Path != "/tasker" {
+		t.Errorf("cookie Path = %q, want the mount prefix — at %q it is sent "+
+			"on every request to the host application", cookie.Path, cookie.Path)
+	}
+
+	// An unprefixed mount still has to work, and "" is not a valid Path.
+	bare := New(tasker.NewManager(tasker.WithDriver(&stubDriver{})), nil)
+	bare.UseAuth(func(next http.Handler) http.Handler { return next })
+	bare.UseCSRF()
+	res = httptest.NewRecorder()
+	bare.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/", nil))
+	for _, c := range res.Result().Cookies() {
+		if c.Name == csrfCookieName && c.Path != "/" {
+			t.Errorf("unprefixed mount issued Path %q, want /", c.Path)
+		}
+	}
+}
+
+// TestTheCSRFCookieDoesNotCollideWithTheApplications.
+//
+// The name is the load-bearing part. lemmego/api's CSRF is session-backed:
+// its XSRF-TOKEN cookie only delivers the session's token to JavaScript, and
+// the check compares the request header against the *session*. This
+// middleware writes a fresh random value into its cookie on any GET that
+// arrives without one — a value that is in no session. Under the name
+// XSRF-TOKEN it would overwrite the application's cookie and CSRF would
+// start failing on pages that have nothing to do with the queue.
+func TestTheCSRFCookieDoesNotCollideWithTheApplications(t *testing.T) {
+	for _, reserved := range []string{"XSRF-TOKEN", "csrf_token", "_token"} {
+		if csrfCookieName == reserved {
+			t.Errorf("the dashboard writes %q, which is a name host frameworks "+
+				"use — it would overwrite the application's token with one no "+
+				"session knows", reserved)
+		}
+	}
+	if !strings.HasPrefix(csrfCookieName, "tasker") {
+		t.Errorf("csrfCookieName = %q, want a tasker-namespaced name so an "+
+			"embedded dashboard cannot clobber its host", csrfCookieName)
+	}
+}

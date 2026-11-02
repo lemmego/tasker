@@ -54,7 +54,7 @@ func (s *Server) UseAuth(mw func(http.Handler) http.Handler) {
 // UseCSRF protects state-changing management requests with a double-submit
 // token. It is intended to be used alongside UseAuth for browser sessions.
 func (s *Server) UseCSRF() {
-	s.Use(csrfMiddleware)
+	s.Use(csrfMiddleware(s.cookiePath()))
 }
 
 func (s *Server) Handler() http.Handler {
@@ -519,35 +519,76 @@ const (
 	csrfHeaderName = "X-CSRF-Token"
 )
 
-func csrfMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
-			if _, err := r.Cookie(csrfCookieName); err != nil {
-				token, err := newCSRFToken()
-				if err != nil {
-					writeError(w, http.StatusInternalServerError, "could not create csrf token")
-					return
+// cookiePath scopes the CSRF cookie to where the dashboard is mounted.
+//
+// Not "/", which is what it used to be. A cookie at the root is sent on every
+// request to the host application — every page, every API call, every asset —
+// to be read by nothing, because only this dashboard's script looks at it.
+// Scoped to the mount prefix it is sent to the dashboard and nowhere else,
+// and the script can still read it because the script only ever runs under
+// that prefix.
+func (s *Server) cookiePath() string {
+	if s.prefix == "" {
+		return "/"
+	}
+	return s.prefix
+}
+
+// csrfMiddleware is a double-submit guard, deliberately its own rather than
+// the host framework's.
+//
+// tasker does not depend on lemmego/api and must not: it is a standalone
+// queue that runs in programs with no framework at all, so it has no session
+// to bind a token to and no middleware stack to borrow one from.
+//
+// # Why the names differ from the application's
+//
+// This is the load-bearing part, and it is the cookie name rather than the
+// header. lemmego/api's CSRF is *session-backed*: its XSRF-TOKEN cookie only
+// delivers the session's _token to JavaScript, and the check compares the
+// request header against the session, never against the cookie. Reading the
+// token back out of the cookie is commented out in that file on purpose,
+// because doing so would turn a session-bound token into a plain
+// double-submit.
+//
+// So a shared cookie name would be worse than untidy. This middleware writes
+// a fresh random value into the cookie whenever a GET arrives without one —
+// and that value is in no session. Under the name XSRF-TOKEN it would
+// overwrite the application's cookie, the next form post anywhere on the site
+// would send a token the session does not know, and CSRF would start failing
+// on pages that have nothing to do with the queue. A separate name is what
+// keeps an embedded dashboard from breaking its host.
+func csrfMiddleware(cookiePath string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+				if _, err := r.Cookie(csrfCookieName); err != nil {
+					token, err := newCSRFToken()
+					if err != nil {
+						writeError(w, http.StatusInternalServerError, "could not create csrf token")
+						return
+					}
+					http.SetCookie(w, &http.Cookie{
+						Name:     csrfCookieName,
+						Value:    token,
+						Path:     cookiePath,
+						HttpOnly: false,
+						SameSite: http.SameSiteStrictMode,
+					})
 				}
-				http.SetCookie(w, &http.Cookie{
-					Name:     csrfCookieName,
-					Value:    token,
-					Path:     "/",
-					HttpOnly: false,
-					SameSite: http.SameSiteStrictMode,
-				})
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			cookie, err := r.Cookie(csrfCookieName)
+			provided := r.Header.Get(csrfHeaderName)
+			if err != nil || provided == "" || !secureStringEqual(cookie.Value, provided) {
+				writeError(w, http.StatusForbidden, "invalid csrf token")
+				return
 			}
 			next.ServeHTTP(w, r)
-			return
-		}
-
-		cookie, err := r.Cookie(csrfCookieName)
-		provided := r.Header.Get(csrfHeaderName)
-		if err != nil || provided == "" || !secureStringEqual(cookie.Value, provided) {
-			writeError(w, http.StatusForbidden, "invalid csrf token")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+		})
+	}
 }
 
 func newCSRFToken() (string, error) {
