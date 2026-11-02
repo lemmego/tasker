@@ -120,7 +120,7 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if n, err := strconv.Atoi(l); err == nil {
-			filter.Limit = n
+			filter.Limit = clampLimit(n)
 		}
 	}
 	if o := r.URL.Query().Get("offset"); o != "" {
@@ -248,6 +248,18 @@ func (s *Server) handleBatchCancel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
+	// A nil supervisor is a legitimate construction: New(manager, nil) is
+	// public, and a process that reads the queue without working it has no
+	// supervisor to give. It used to be a nil pointer dereference here,
+	// which the api recoverer turns into a 500 on the one endpoint the
+	// dashboard's overview cannot render without.
+	if s.supervisor == nil {
+		// An empty list rather than an error. "This process runs no
+		// workers" is not a failure, and the dashboard says so in those
+		// words rather than claiming there are no queues.
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
 	queues := s.supervisor.Queues()
 	type queueInfo struct {
 		Name   tasker.QueueName   `json:"name"`
@@ -277,6 +289,11 @@ func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePauseQueue(w http.ResponseWriter, r *http.Request) {
 	queue := tasker.QueueName(r.PathValue("queue"))
+	if s.supervisor == nil {
+		writeError(w, http.StatusConflict,
+			"this process runs no workers, so it cannot pause a queue")
+		return
+	}
 	if err := s.supervisor.PauseQueue(queue); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -286,6 +303,11 @@ func (s *Server) handlePauseQueue(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleResumeQueue(w http.ResponseWriter, r *http.Request) {
 	queue := tasker.QueueName(r.PathValue("queue"))
+	if s.supervisor == nil {
+		writeError(w, http.StatusConflict,
+			"this process runs no workers, so it cannot resume a queue")
+		return
+	}
 	if err := s.supervisor.ResumeQueue(queue); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -345,6 +367,10 @@ func (s *Server) handleQueueMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var result []metric
+	if s.supervisor == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
 	for _, q := range s.supervisor.Queues() {
 		stats, err := s.manager.QueueStats(r.Context(), q)
 		if err != nil {
@@ -369,32 +395,86 @@ func (s *Server) handleQueueMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "streaming not supported")
-		return
-	}
+	// http.NewResponseController rather than w.(http.Flusher), and this is
+	// the bug that mattered most: a type assertion traverses nothing, so any
+	// middleware wrapping the ResponseWriter — lemmego's own RequestLogger
+	// among them — made this answer 500 "streaming not supported" for every
+	// request. The controller follows Unwrap, so a wrapped writer works.
+	rc := http.NewResponseController(w)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	// nginx buffers text/event-stream by default, which makes a working
+	// stream look dead through a proxy and nowhere else.
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	// Flushed before anything is sent, so the client can tell "connected"
+	// from "hung". Without it the first observable byte was the first tick,
+	// which is five seconds of a dashboard that looks broken.
+	if err := rc.Flush(); err != nil {
+		return
+	}
 
 	ctx := r.Context()
+
+	// The server's write deadline is not the stream's. api/app sets one on
+	// http.Server, so without clearing it the connection dies partway through
+	// and the browser reconnects in a loop; a stream owns its own lifetime.
+	// Best-effort: a writer that cannot do this still works, it just ends at
+	// the server's deadline and reconnects.
+	_ = rc.SetWriteDeadline(time.Time{})
+
+	send := func() bool {
+		stats, err := s.manager.GlobalStats(ctx)
+		if err != nil {
+			// A failed read is not a reason to drop the connection: the next
+			// tick may well succeed, and a reconnect loop is worse than a
+			// gap. A comment frame keeps the socket warm meanwhile.
+			fmt.Fprint(w, ": stats unavailable\n\n")
+			return rc.Flush() == nil
+		}
+		data, err := json.Marshal(stats)
+		if err != nil {
+			return true
+		}
+		// A named event, so a client can listen for this one specifically
+		// rather than for whatever arrives.
+		fmt.Fprintf(w, "event: stats\ndata: %s\n\n", data)
+		return rc.Flush() == nil
+	}
+
+	// Immediately, not on the first tick. The dashboard paints from this
+	// frame, so waiting five seconds for it is five seconds of empty page.
+	if !send() {
+		return
+	}
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
+	// Comfortably under the idle timeout of every proxy worth naming. An
+	// idle intermediary closes a connection it believes is dead, and a
+	// five-second data tick is not a heartbeat: it stops being sent the
+	// moment GlobalStats starts failing, which is exactly when the
+	// connection matters.
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			stats, err := s.manager.GlobalStats(ctx)
-			if err != nil {
-				continue
+			if !send() {
+				return
 			}
-			data, _ := json.Marshal(stats)
-			fmt.Fprintf(w, "data: %s\n\n", data)
-			flusher.Flush()
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": keepalive\n\n")
+			if rc.Flush() != nil {
+				return
+			}
 		}
 	}
 }
@@ -476,4 +556,31 @@ func secureStringEqual(a, b string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// DefaultPageSize and MaxPageSize bound a job listing.
+//
+// The limit arrives from a query string, which is the normal case rather
+// than the hostile one — a dashboard builds the URL — but it was previously
+// passed through untouched, so limit=1000000 was a request for a million
+// rows that the database would honour. One request, and the process is out
+// of memory.
+const (
+	DefaultPageSize = 50
+	MaxPageSize     = 500
+)
+
+// clampLimit keeps a listing bounded.
+//
+// Zero and negative mean "unspecified" rather than "none": a caller asking
+// for no rows is almost always a caller who built the URL wrong, and
+// answering an empty list reads as an empty queue.
+func clampLimit(n int) int {
+	if n <= 0 {
+		return DefaultPageSize
+	}
+	if n > MaxPageSize {
+		return MaxPageSize
+	}
+	return n
 }
