@@ -510,7 +510,14 @@ func parseID(s string) (tasker.JobID, error) {
 	return tasker.JobID(n), nil
 }
 
-const csrfCookieName = "tasker_csrf"
+const (
+	csrfCookieName = "tasker_csrf"
+
+	// csrfHeaderName is named rather than written twice. The dashboard has to
+	// send exactly this, in a JavaScript string literal no compiler reads, so
+	// a test pins the two together.
+	csrfHeaderName = "X-CSRF-Token"
+)
 
 func csrfMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -534,7 +541,7 @@ func csrfMiddleware(next http.Handler) http.Handler {
 		}
 
 		cookie, err := r.Cookie(csrfCookieName)
-		provided := r.Header.Get("X-CSRF-Token")
+		provided := r.Header.Get(csrfHeaderName)
 		if err != nil || provided == "" || !secureStringEqual(cookie.Value, provided) {
 			writeError(w, http.StatusForbidden, "invalid csrf token")
 			return

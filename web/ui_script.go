@@ -139,10 +139,37 @@ function get(path){
     return r.json();
   });
 }
+/* The double-submit token.
+ *
+ * The server sets a tasker_csrf cookie on any GET that arrives without one —
+ * deliberately not HttpOnly, because reading it here is the point — and
+ * refuses every state-changing request whose X-CSRF-Token header does not
+ * match it.
+ *
+ * Every POST this dashboard makes needs it: Prune, Retry, Cancel, Pause,
+ * Resume. Rewriting the script without it made all five answer
+ * 403 "invalid csrf token", and only Prune got clicked first.
+ */
+function csrfToken(){
+  var parts = document.cookie ? document.cookie.split('; ') : [];
+  for (var i = 0; i < parts.length; i++) {
+    if (parts[i].indexOf('tasker_csrf=') === 0) {
+      return decodeURIComponent(parts[i].substring('tasker_csrf='.length));
+    }
+  }
+  return '';
+}
+
 function post(path, body){
+  var headers = {'Content-Type':'application/json'};
+  var token = csrfToken();
+  /* Sent only when there is one. An absent header and an empty one are
+   * refused identically by the server, and omitting it keeps the request
+   * honest about what it has. */
+  if (token) headers['X-CSRF-Token'] = token;
   return fetch(path, {
     method:'POST',
-    headers:{'Content-Type':'application/json'},
+    headers:headers,
     body: body ? JSON.stringify(body) : null
   }).then(function(r){
     if (!r.ok) return r.json().then(function(b){

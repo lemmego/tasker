@@ -374,3 +374,78 @@ func TestTheFirstPaintDoesNotFlashEveryRow(t *testing.T) {
 			"panel's first render flashes everything")
 	}
 }
+
+// TestTheDashboardSendsTheCSRFToken.
+//
+// The server sets tasker_csrf on a GET and refuses every state-changing
+// request whose X-CSRF-Token header does not match it. Rewriting the script
+// without that read made Prune, Retry, Cancel, Pause and Resume all answer
+// 403 "invalid csrf token" — five broken buttons, reported after the first
+// one was clicked.
+//
+// Both names come from the Go side rather than being typed again here, so
+// renaming the cookie or the header breaks this test instead of the
+// dashboard. That coupling is the whole point: the constant is in web.go and
+// the string that has to match it is in a JavaScript literal no compiler
+// reads.
+func TestTheDashboardSendsTheCSRFToken(t *testing.T) {
+	if !strings.Contains(dashboardJS, csrfCookieName+"=") {
+		t.Errorf("the dashboard never reads the %s cookie, so every POST it "+
+			"makes is refused", csrfCookieName)
+	}
+	if !strings.Contains(dashboardJS, csrfHeaderName) {
+		t.Errorf("the dashboard never sends the %s header, so every POST it "+
+			"makes is refused", csrfHeaderName)
+	}
+	// And it has to be on the shared helper rather than one call site, since
+	// five buttons go through it.
+	if !strings.Contains(dashboardJS, "function post(path, body){") {
+		t.Fatal("the POST helper has moved; this test is reading the wrong code")
+	}
+	helper := dashboardJS[strings.Index(dashboardJS, "function post(path, body){"):]
+	if end := strings.Index(helper, "\n}\n"); end > 0 {
+		helper = helper[:end]
+	}
+	if !strings.Contains(helper, csrfHeaderName) {
+		t.Error("the token is read somewhere but not attached in post(), so " +
+			"whichever buttons do not build their own headers are refused")
+	}
+}
+
+// TestAStateChangingRequestWithoutATokenIsRefused, so the test above is
+// guarding something real rather than a string nobody checks.
+func TestAStateChangingRequestWithoutATokenIsRefused(t *testing.T) {
+	s := openServer(t)
+	// Opt-in, the way queue.Provider mounts it. Without this the dashboard is
+	// unprotected and the assertions below pass for the wrong reason — which
+	// is how the first version of this test failed.
+	s.UseCSRF()
+
+	res := httptest.NewRecorder()
+	s.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/api/prune", nil))
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("POST with no token = %d, want 403", res.Code)
+	}
+
+	// With the cookie the server itself issued, and the matching header.
+	get := httptest.NewRecorder()
+	s.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/", nil))
+	var token string
+	for _, c := range get.Result().Cookies() {
+		if c.Name == csrfCookieName {
+			token = c.Value
+		}
+	}
+	if token == "" {
+		t.Fatal("a GET did not issue a csrf cookie, so the dashboard has nothing to read")
+	}
+
+	ok := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/prune", nil)
+	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: token})
+	req.Header.Set(csrfHeaderName, token)
+	s.ServeHTTP(ok, req)
+	if ok.Code == http.StatusForbidden {
+		t.Error("a POST carrying the issued token was still refused")
+	}
+}
