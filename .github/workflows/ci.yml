@@ -28,6 +28,27 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # A real Redis, because miniredis is not one where it matters most. Its
+    # Lua encodes an empty table as `[]`; Redis's cjson encodes it as `{}`,
+    # which is an object in a field the driver reads back as a slice — so a
+    # retried job became permanently undecodable and every test in the package
+    # passed anyway. The redis driver's scripts are only genuinely exercised
+    # against the cjson they run on.
+    services:
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      TASKER_REDIS_ADDR: 127.0.0.1:6379
+
     steps:
       - uses: actions/checkout@v4
 
