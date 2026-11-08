@@ -1,6 +1,7 @@
 package redisdriver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -47,7 +48,40 @@ func (d *Driver) key(suffix string) string       { return d.config.KeyPrefix + s
 func (d *Driver) Ping(ctx context.Context) error { return d.client.Ping(ctx).Err() }
 func (d *Driver) Close() error                   { return d.client.Close() }
 
-var enqueueScript = redis.NewScript(`
+// luaEncode is the prelude every script that writes a job or a node back to
+// Redis is built from. Lua has one table type, so cjson cannot tell an empty
+// array from an empty object and encodes `{}` for both — which means a job
+// does not survive a round trip through a script unless something intervenes.
+// Two ways that bit: the retry script assigns `job.errors = {}` to clear the
+// attempt history, and *any* script re-encodes a `"tags":[]` written by Go as
+// `"tags":{}`. Either way the field comes back as an object where Go expects a
+// slice, so the job can never be decoded again — and because the dashboard
+// decodes the whole hash at once, one retried job took down the jobs list, the
+// queue stats and every claim from that queue with it.
+//
+// So an empty list is emptied to null instead, which Go reads back as a nil
+// slice and the existing wire format already carries for a job with no tags.
+// Every list-valued field has to be named here; miniredis encodes an empty
+// table as `[]`, so no test in this package can catch one that is missed.
+const luaEncode = `
+local function tasker_list(value)
+  if value == nil or value == cjson.null then return cjson.null end
+  if type(value) == 'table' and next(value) == nil then return cjson.null end
+  return value
+end
+local function tasker_encode_job(job)
+  job.errors = tasker_list(job.errors)
+  job.tags = tasker_list(job.tags)
+  job.attempted_by = tasker_list(job.attempted_by)
+  return cjson.encode(job)
+end
+local function tasker_encode_node(node)
+  node.queues = tasker_list(node.queues)
+  return cjson.encode(node)
+end
+`
+
+var enqueueScript = redis.NewScript(luaEncode + `
 local seen = {}
 for i = 1, #ARGV, 4 do
   local uuid = ARGV[i]
@@ -62,7 +96,7 @@ for i = 1, #ARGV, 4 do
   local job = cjson.decode(ARGV[i + 1])
   job.id = id
   redis.call('HSET', KEYS[2], ARGV[i], tostring(id))
-  redis.call('HSET', KEYS[3], tostring(id), cjson.encode(job))
+  redis.call('HSET', KEYS[3], tostring(id), tasker_encode_job(job))
   redis.call('ZADD', KEYS[4], id, tostring(id))
   redis.call('ZADD', KEYS[5], ARGV[i + 2], tostring(id))
   if job.state == 'available' or job.state == 'scheduled' or job.state == 'retryable' then
@@ -114,7 +148,7 @@ func (d *Driver) EnqueueBatch(ctx context.Context, jobs []*tasker.JobRow) error 
 	return nil
 }
 
-var claimScript = redis.NewScript(`
+var claimScript = redis.NewScript(luaEncode + `
 local due = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'WITHSCORES')
 local candidates = {}
 for i = 1, #due, 2 do
@@ -151,7 +185,7 @@ for i = 1, math.min(maximum, #candidates) do
   if job.attempted_by == nil or job.attempted_by == cjson.null then job.attempted_by = {} end
   if #job.attempted_by >= 50 then table.remove(job.attempted_by, 1) end
   job.attempted_by[#job.attempted_by + 1] = ARGV[4]
-  local encoded = cjson.encode(job)
+  local encoded = tasker_encode_job(job)
   redis.call('HSET', KEYS[1], item.id, encoded)
   redis.call('ZREM', KEYS[2], item.id)
   redis.call('ZADD', KEYS[3], ARGV[1], item.id)
@@ -174,7 +208,7 @@ func (d *Driver) Claim(ctx context.Context, queue tasker.QueueName, nodeID taske
 	return decodeJobs(result)
 }
 
-var finishScript = redis.NewScript(`
+var finishScript = redis.NewScript(luaEncode + `
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then return 0 end
 local job = cjson.decode(raw)
@@ -183,7 +217,7 @@ job.state = 'completed'
 job.output = ARGV[2]
 job.completed_at = ARGV[3]
 job.finalized_at = ARGV[3]
-redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(job))
+redis.call('HSET', KEYS[1], ARGV[1], tasker_encode_job(job))
 redis.call('ZREM', KEYS[2], ARGV[1])
 return 1
 `)
@@ -205,7 +239,7 @@ func (d *Driver) Complete(ctx context.Context, id tasker.JobID, output []byte) e
 	return nil
 }
 
-var failScript = redis.NewScript(`
+var failScript = redis.NewScript(luaEncode + `
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then return 0 end
 local job = cjson.decode(raw)
@@ -217,7 +251,7 @@ failure.attempt = tonumber(job.attempt) or 0
 job.errors[#job.errors + 1] = failure
 job.completed_at = ARGV[3]
 job.finalized_at = ARGV[3]
-redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(job))
+redis.call('HSET', KEYS[1], ARGV[1], tasker_encode_job(job))
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('ZREM', KEYS[3] .. job.queue, ARGV[1])
 return 1
@@ -241,7 +275,7 @@ func (d *Driver) Fail(ctx context.Context, id tasker.JobID, jobErr error) error 
 	return nil
 }
 
-var scheduleRetryScript = redis.NewScript(`
+var scheduleRetryScript = redis.NewScript(luaEncode + `
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then return 0 end
 local job = cjson.decode(raw)
@@ -258,7 +292,7 @@ if job.errors == nil or job.errors == cjson.null then job.errors = {} end
 local failure = cjson.decode(ARGV[3])
 failure.attempt = tonumber(job.attempt) or 0
 job.errors[#job.errors + 1] = failure
-redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(job))
+redis.call('HSET', KEYS[1], ARGV[1], tasker_encode_job(job))
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('ZADD', KEYS[3] .. job.queue, ARGV[4], ARGV[1])
 return 1
@@ -284,7 +318,7 @@ func (d *Driver) ScheduleRetry(ctx context.Context, id tasker.JobID, jobErr erro
 	return nil
 }
 
-var retryScript = redis.NewScript(`
+var retryScript = redis.NewScript(luaEncode + `
 local allowed = {failed=true, completed=true, cancelled=true, retryable=true}
 local jobs = {}
 for i = 2, #ARGV - 1 do
@@ -306,7 +340,7 @@ for _, item in ipairs(jobs) do
   job.completed_at = cjson.null
   job.finalized_at = cjson.null
   job.output = cjson.null
-  redis.call('HSET', KEYS[1], item.id, cjson.encode(job))
+  redis.call('HSET', KEYS[1], item.id, tasker_encode_job(job))
   redis.call('ZADD', KEYS[2] .. job.queue, ARGV[#ARGV], item.id)
   redis.call('ZREM', KEYS[3], item.id)
 end
@@ -338,7 +372,7 @@ func (d *Driver) retryBatch(ctx context.Context, ids []tasker.JobID) error {
 	return transitionError(err)
 }
 
-var cancelScript = redis.NewScript(`
+var cancelScript = redis.NewScript(luaEncode + `
 local allowed = {available=true, pending=true, scheduled=true, retryable=true}
 local jobs = {}
 for i = 2, #ARGV do
@@ -351,7 +385,7 @@ end
 for _, item in ipairs(jobs) do
   item.job.state = 'cancelled'
   item.job.finalized_at = ARGV[1]
-  redis.call('HSET', KEYS[1], item.id, cjson.encode(item.job))
+  redis.call('HSET', KEYS[1], item.id, tasker_encode_job(item.job))
   redis.call('ZREM', KEYS[2] .. item.job.queue, item.id)
 end
 return #jobs
@@ -565,12 +599,12 @@ func (d *Driver) DeregisterNode(ctx context.Context, nodeID tasker.NodeID) error
 	return err
 }
 
-var heartbeatScript = redis.NewScript(`
+var heartbeatScript = redis.NewScript(luaEncode + `
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
 local node = cjson.decode(raw)
 node.last_heartbeat = ARGV[1]
-redis.call('SET', KEYS[1], cjson.encode(node), 'PX', ARGV[2])
+redis.call('SET', KEYS[1], tasker_encode_node(node), 'PX', ARGV[2])
 return 1
 `)
 
@@ -658,7 +692,7 @@ func (d *Driver) ReleaseLock(ctx context.Context, key string, nodeID tasker.Node
 	return ownerDeleteScript.Run(ctx, d.client, []string{d.key("lock:" + key)}, string(nodeID)).Err()
 }
 
-var staleScript = redis.NewScript(`
+var staleScript = redis.NewScript(luaEncode + `
 local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
 local count = 0
 for _, id in ipairs(ids) do
@@ -669,7 +703,7 @@ for _, id in ipairs(ids) do
       job.state = 'available'
       job.node_id = ''
       job.scheduled_at = ARGV[2]
-      redis.call('HSET', KEYS[1], id, cjson.encode(job))
+      redis.call('HSET', KEYS[1], id, tasker_encode_job(job))
       redis.call('ZADD', KEYS[3] .. job.queue, ARGV[3], id)
       count = count + 1
     end
@@ -733,12 +767,47 @@ func (d *Driver) allJobs(ctx context.Context) ([]*tasker.JobRow, error) {
 	return decodeJobs(values)
 }
 
+// storedJob shadows the list-valued fields of a JobRow so a job written
+// before luaEncode existed can still be read. Such a job carries `{}` where
+// the field has to be a list, and the fields are shadowed rather than fixed up
+// in the raw JSON because `"errors":{}` is also a legal substring of a
+// recorded error message.
+//
+// An empty object only ever meant an empty list, so reading it as one cannot
+// hide anything — and a job that decodes gets rewritten correctly by its next
+// transition, which is what lets a deployment heal its own queue instead of
+// needing someone to go and edit Redis by hand.
+type storedJob struct {
+	tasker.JobRow
+	Errors      json.RawMessage `json:"errors"`
+	Tags        json.RawMessage `json:"tags"`
+	AttemptedBy json.RawMessage `json:"attempted_by"`
+}
+
 func decodeJob(raw string) (*tasker.JobRow, error) {
-	var job tasker.JobRow
-	if err := json.Unmarshal([]byte(raw), &job); err != nil {
+	var stored storedJob
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
 		return nil, fmt.Errorf("decode job: %w", err)
 	}
+	job := stored.JobRow
+	if err := decodeList(stored.Errors, &job.Errors); err != nil {
+		return nil, fmt.Errorf("decode job errors: %w", err)
+	}
+	if err := decodeList(stored.Tags, &job.Tags); err != nil {
+		return nil, fmt.Errorf("decode job tags: %w", err)
+	}
+	if err := decodeList(stored.AttemptedBy, &job.AttemptedBy); err != nil {
+		return nil, fmt.Errorf("decode job attempted_by: %w", err)
+	}
 	return &job, nil
+}
+
+func decodeList(raw json.RawMessage, target any) error {
+	switch string(bytes.TrimSpace(raw)) {
+	case "", "null", "{}":
+		return nil
+	}
+	return json.Unmarshal(raw, target)
 }
 
 func decodeJobs(values []string) ([]*tasker.JobRow, error) {
