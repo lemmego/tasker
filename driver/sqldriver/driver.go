@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -186,8 +187,20 @@ func (d *Driver) Migrate(ctx context.Context) error {
 	}
 
 	if _, ok := d.dialect.(*sqliteDialect); ok {
+		// Best effort, deliberately. busy_timeout tells SQLite how long to
+		// wait on a locked database file, which is a useful convenience on a
+		// local file and meaningless on a server-backed one -- libSQL refuses
+		// the statement outright with "unsupported statement: PRAGMA
+		// busy_timeout=5000", and it is not alone: libSQL prohibits
+		// journal_mode, synchronous and the wal_checkpoint pragmas too,
+		// because it requires exclusive control of the WAL.
+		//
+		// Failing the whole migration over a lock-wait hint made the queue
+		// unusable on libSQL for no gain: there is no local file to contend
+		// for, so the hint has nothing to tell.
 		if _, err := d.db.ExecContext(ctx, "PRAGMA busy_timeout=5000"); err != nil {
-			return err
+			slog.Debug("tasker: could not set busy_timeout; continuing without it",
+				"err", err)
 		}
 	}
 	return nil
