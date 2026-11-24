@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/glebarez/go-sqlite"
 )
 
 func openSQLite(t *testing.T) *sql.DB {
